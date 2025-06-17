@@ -31,16 +31,16 @@
  */
 
 /* for debug */
-/* #define ONIG_DEBUG_PARSE_TREE */
-/* #define ONIG_DEBUG_COMPILE */
-/* #define ONIG_DEBUG_SEARCH */
-/* #define ONIG_DEBUG_MATCH */
-/* #define ONIG_DEBUG_MATCH_CACHE */
-/* #define ONIG_DEBUG_MEMLEAK */
+#define ONIG_DEBUG_PARSE_TREE
+#define ONIG_DEBUG_COMPILE
+#define ONIG_DEBUG_SEARCH
+#define ONIG_DEBUG_MATCH
+#define ONIG_DEBUG_MATCH_CACHE
+#define ONIG_DEBUG_MEMLEAK
 /* #define ONIG_DONT_OPTIMIZE */
 
 /* for byte-code statistical data. */
-/* #define ONIG_DEBUG_STATISTICS */
+#define ONIG_DEBUG_STATISTICS
 
 /* enable the match optimization by using a cache. */
 #define USE_MATCH_CACHE
@@ -879,6 +879,9 @@ typedef struct _OnigStackType {
     struct {
       long    index;      /* index of the match cache buffer */
       uint8_t mask;       /* bit-mask for the match cache buffer */
+
+      uint8_t cache_point;    /* For RLE*/
+      long input_pos;         /* For RLE*/
     } match_cache_point;
 #endif
   } u;
@@ -894,6 +897,19 @@ typedef struct {
   int lookaround_nesting;
   UChar *match_addr;
 } OnigCacheOpcode;
+
+typedef struct 
+{
+  long start;
+  long end;
+}OnigMatchRun;
+
+typedef struct
+{
+  OnigMatchRun* runs;
+  int count;
+  int capacity;
+}OnigMatchRunList;
 #endif
 
 typedef struct {
@@ -925,6 +941,8 @@ typedef struct {
   OnigCacheOpcode* cache_opcodes;
   long             num_cache_points;
   uint8_t*         match_cache_buf;
+  int              use_rle;
+  OnigMatchRunList* match_cache_rle;
 #endif
 } OnigMatchArg;
 
