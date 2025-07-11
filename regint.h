@@ -45,9 +45,13 @@
 /* enable the match optimization by using a cache. */
 #define USE_MATCH_CACHE
 
+/* for RLE implementation. */
+#define ONIG_DEBUG_RLE
+
 #if defined(ONIG_DEBUG_PARSE_TREE) || defined(ONIG_DEBUG_MATCH) || \
     defined(ONIG_DEBUG_SEARCH) || defined(ONIG_DEBUG_COMPILE) || \
-    defined(ONIG_DEBUG_STATISTICS) || defined(ONIG_DEBUG_MEMLEAK)
+    defined(ONIG_DEBUG_STATISTICS) || defined(ONIG_DEBUG_MEMLEAK) || \
+    defined(ONIG_DEBUG_RLE)
 # ifndef ONIG_DEBUG
 #  define ONIG_DEBUG
 # endif
@@ -880,7 +884,7 @@ typedef struct _OnigStackType {
       long    index;      /* index of the match cache buffer */
       uint8_t mask;       /* bit-mask for the match cache buffer */
 
-      uint8_t cache_point;    /* For RLE*/
+      long cache_point;    /* For RLE*/
       long input_pos;         /* For RLE*/
     } match_cache_point;
 #endif
@@ -898,18 +902,28 @@ typedef struct {
   UChar *match_addr;
 } OnigCacheOpcode;
 
-typedef struct 
-{
+typedef struct {
   long start;
   long end;
-}OnigMatchRun;
+} OnigMatchRun;
 
-typedef struct
-{
-  OnigMatchRun* runs;
+typedef struct {
   int count;
   int capacity;
-}OnigMatchRunList;
+  OnigMatchRun* runs;
+} OnigMatchRunList;
+
+typedef struct {
+  long cache_point;
+  OnigMatchRunList run_list;
+} OnigMemoEntry;
+
+typedef struct {
+  int count;
+  int capacity;
+  OnigMemoEntry* entries;
+} OnigMemoRLETable;
+
 #endif
 
 typedef struct {
@@ -942,7 +956,7 @@ typedef struct {
   long             num_cache_points;
   uint8_t*         match_cache_buf;
   int              use_rle;
-  OnigMatchRunList* match_cache_rle;
+  OnigMemoRLETable* rle_table;
 #endif
 } OnigMatchArg;
 

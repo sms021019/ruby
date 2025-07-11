@@ -1075,63 +1075,143 @@ static size_t total_rle_bytes = 0;
   (msa).cache_opcodes = (OnigCacheOpcode*)NULL;\
   (msa).num_cache_points = 0;\
   (msa).match_cache_buf = (uint8_t*)NULL;\
-  (msa).match_cache_rle = (OnigMatchRunList*)NULL;\
+  (msa).rle_table = (OnigMemoRLETable*)NULL;\
 } while(0)
 #define MATCH_ARG_FREE_MATCH_CACHE(msa) do {\
   xfree((msa).cache_opcodes);\
   if((msa).match_cache_buf != NULL) {\
     xfree((msa).match_cache_buf);\
   }\
-  if ((msa).match_cache_rle != NULL) {\
-    for (int _i = 0; _i < (msa).num_cache_points; _i++) {\
-      free_match_run_list(&(msa).match_cache_rle[_i]);\
+  if ((msa).rle_table != NULL) {\
+    for (int _i = 0; _i < (msa).rle_table->count; ++_i) {\
+      xfree((msa).rle_table->entries[_i].run_list.runs);\
     }\
-    xfree((msa).match_cache_rle);\
+    xfree((msa).rle_table->entries);\
   }\
   (msa).cache_opcodes = (OnigCacheOpcode*)NULL;\
   (msa).match_cache_buf = (uint8_t*)NULL;\
-  (msa).match_cache_rle = (OnigMatchRunList*)NULL;\
+  (msa).rle_table = (OnigMemoRLETable*)NULL;\
 } while(0)
 #else
 #define MATCH_ARG_INIT_MATCH_CACHE(msa)
 #define MATCH_ARG_FREE_MATCH_CACHE(msa)
 #endif
 
+#define INITIAL_ENTRY_CAPACITY 8
+#define INITIAL_RUN_CAPACITY 4
+
 #ifdef USE_MATCH_CACHE
 // Initialize a run list for one cache point
-void init_match_run_list(OnigMatchRunList* list) {
-  list->count = 0;
-  list->capacity = 4;
-  list->runs = (OnigMatchRun*) malloc(sizeof(OnigMatchRun) * list->capacity);
+void onig_rle_table_init(OnigMemoRLETable* rle_table) {
+  rle_table->count = 0;
+  rle_table->capacity = INITIAL_ENTRY_CAPACITY;
+  rle_table->entries = (OnigMemoEntry*) xmalloc(sizeof(OnigMemoEntry) * rle_table->capacity);
 }
 
-// Free a run list
-void free_match_run_list(OnigMatchRunList* list) {
-  if (list->runs) {
-    free(list->runs);
-    list->runs = NULL;
+// Lookup or create the run list for a cache point
+static inline OnigMatchRunList*
+onig_rle_get_or_create(OnigMemoRLETable* table, int cache_point) {
+  for (int i = 0; i < table->count; ++i) {
+    if (table->entries[i].cache_point == cache_point) {
+      return &table->entries[i].run_list;
+    }
   }
-  list->count = 0;
-  list->capacity = 0;
+
+  // Extend table if needed
+  if (table->count == table->capacity) {
+    table->capacity *= 2;
+    table->entries = (OnigMemoEntry*) xrealloc(table->entries, sizeof(OnigMemoEntry) * table->capacity);
+  }
+
+  // Initialize new entry
+  OnigMemoEntry* entry = &table->entries[table->count++];
+  entry->cache_point = cache_point;
+  entry->run_list.count = 0;
+  entry->run_list.capacity = INITIAL_RUN_CAPACITY;
+  entry->run_list.runs = (OnigMatchRun*) xmalloc(sizeof(OnigMatchRun) * INITIAL_RUN_CAPACITY);
+  return &entry->run_list;
 }
 
-// Insert a position into the RLE run list
-void insert_rle_run(OnigMatchRunList* list, long input_pos) {
-  fprintf(stderr, "MATCH RLE: Entered insert_rle_run\n");
-  
+// Insert an input_pos into the corresponding run list
+static inline void
+onig_rle_insert(OnigMemoRLETable* table, long cache_point, long input_pos) {
+  OnigMatchRunList* list = onig_rle_get_or_create(table, cache_point);
   for (int i = 0; i < list->count; ++i) {
     OnigMatchRun* run = &list->runs[i];
     if (input_pos >= run->start && input_pos <= run->end) {
+#ifdef ONIG_DEBUG_RLE
       fprintf(stderr, "MATCH RLE: Already memoized\n");
-      return; // Already memoized
+#endif
+      return;
+    } // Already memoized
+    if (input_pos == run->end + 1) { 
+#ifdef ONIG_DEBUG_RLE
+      fprintf(stderr, "MATCH RLE: Extended forward\n");
+#endif
+      run->end++; return; 
+    }
+    if (input_pos == run->start - 1) { 
+#ifdef ONIG_DEBUG_RLE
+      fprintf(stderr, "MATCH RLE: Extended backward\n");
+#endif
+      run->start--; return; 
+    }
+  }
+
+  // Add new run
+  if (list->count == list->capacity) {
+#ifdef ONIG_DEBUG_RLE
+      fprintf(stderr, "MATCH RLE: Allocating more space...\n");
+#endif
+    list->capacity *= 2;
+    list->runs = (OnigMatchRun*) realloc(list->runs, sizeof(OnigMatchRun) * list->capacity);
+  }
+#ifdef ONIG_DEBUG_RLE
+      fprintf(stderr, "MATCH RLE: New run added!\n");
+#endif
+  list->runs[list->count++] = (OnigMatchRun){input_pos, input_pos};
+}
+
+// Check if a given (input_pos, cache_point) is memoized
+static inline int
+onig_rle_is_memoized(OnigMemoRLETable* table, long cache_point, long input_pos) {
+  for (int i = 0; i < table->count; ++i) {
+    if (table->entries[i].cache_point != cache_point) continue;
+    OnigMatchRunList* list = &table->entries[i].run_list;
+    for (int j = 0; j < list->count; ++j) {
+      if (input_pos >= list->runs[j].start && input_pos <= list->runs[j].end)
+        return 1;
+    }
+  }
+  return 0;
+}
+
+#define OLD_RLE 0
+#if OLD_RLE
+// Insert a position into the RLE run list
+void insert_rle_run(OnigMatchRunList* list, long input_pos) {
+#ifdef ONIG_DEBUG_RLE
+  fprintf(stderr, "MATCH RLE: Entered insert_rle_run with input_pos: %ld\n", input_pos);
+#endif
+  for (int i = 0; i < list->count; ++i) {
+    OnigMatchRun* run = &list->runs[i];
+    if (input_pos >= run->start && input_pos <= run->end) {
+#ifdef ONIG_DEBUG_RLE
+      fprintf(stderr, "MATCH RLE: Already memoized\n");
+#endif
+      return;
     }
     if (input_pos == run->end + 1) {
+#ifdef ONIG_DEBUG_RLE
       fprintf(stderr, "MATCH RLE: Extended forward\n");
+#endif
       run->end++;
       return;
     }
     if (input_pos == run->start - 1) {
+#ifdef ONIG_DEBUG_RLE
       fprintf(stderr, "MATCH RLE: Extended backward\n");
+#endif
       run->start--;
       return;
     }
@@ -1139,20 +1219,19 @@ void insert_rle_run(OnigMatchRunList* list, long input_pos) {
 
   // Add new run
   if (list->count == list->capacity) {
+#ifdef ONIG_DEBUG_RLE
     fprintf(stderr, "MATCH RLE: reallocating more space for rle\n");
-
+#endif
     int old_capacity = list->capacity;
     list->capacity *= 2;
     list->runs = (OnigMatchRun*) realloc(list->runs, sizeof(OnigMatchRun) * list->capacity);
 
     total_rle_bytes += (list->capacity - old_capacity) * sizeof(OnigMatchRun);
   }
-
-  fprintf(stderr, "MATCH RLE: Before adding new run\n");
-
   list->runs[list->count++] = (OnigMatchRun){input_pos, input_pos};
-
-  fprintf(stderr, "MATCH RLE: Brain not braining\n");
+  #ifdef ONIG_DEBUG_RLE
+    fprintf(stderr, "MATCH RLE: New run is memoized. input_pos: %ld, count: %d\n", input_pos, list->count);
+  #endif
 }
 
 // Check if a position is memoized in RLE
@@ -1163,6 +1242,7 @@ bool is_rle_cached(const OnigMatchRunList* list, long input_pos) {
   }
   return false;
 }
+#endif
 #endif
 
 #ifdef USE_FIND_LONGEST_SEARCH_ALL_OF_RANGE
@@ -1237,22 +1317,22 @@ bool is_rle_cached(const OnigMatchRunList* list, long input_pos) {
     fprintf(stderr, "\n=== BITVECTOR DUMP ===\n");\
     fprintf(stderr, "Total size: %zu bits (%zu bytes)\n", num_bits, num_bytes);\
     for (size_t i = 0; i < num_bytes; ++i) {\
-        for (int b = 7; b >= 0; --b) {\
-            fprintf(stderr, "%d", ((msa).match_cache_buf[i] >> b) & 1);\
-        }\
-        fprintf(stderr, " ");\
-        if ((i + 1) % 8 == 0) fprintf(stderr, "\n");\
+      for (int b = 7; b >= 0; --b) {\
+        fprintf(stderr, "%d", ((msa).match_cache_buf[i] >> b) & 1);\
+      }\
+      fprintf(stderr, " ");\
+      if ((i + 1) % 8 == 0) fprintf(stderr, "\n");\
     }\
     fprintf(stderr, "\n=== END OF BITVECTOR ===\n");\
   }\
-  /* RLE memory usage logging */\
-  if ((msa).match_cache_rle != NULL) {\
+  if ((msa).rle_table != NULL) {\
     size_t rle_total_bytes = 0;\
-    for (long i = 0; i < (msa).num_cache_points; ++i) {\
-      rle_total_bytes += (msa).match_cache_rle[i].capacity * sizeof(OnigMatchRun);\
+    for (long i = 0; i < (msa).rle_table->count; ++i) {\
+      rle_total_bytes += (msa).rle_table->entries[i].run_list.capacity * sizeof(OnigMatchRun);\
     }\
     fprintf(stderr, "\n=== RLE MEMORY USAGE ===\n");\
     fprintf(stderr, "Total size: %zu bytes\n", rle_total_bytes);\
+    fprintf(stderr, "Total entries: %ld\n", (msa).rle_table->count);\
     fprintf(stderr, "=== END OF RLE MEMORY ===\n");\
   }\
 } while (0)
@@ -1641,19 +1721,23 @@ stack_double(OnigStackType** arg_stk_base, OnigStackType** arg_stk_end,
 # define MATCH_CACHE_DEBUG_MEMOIZE_RLE(stkp) ((void) 0)
 #endif
 
+#ifdef ONIG_DEBUG_RLE
+# define MATCH_RLE_DEBUG_LOG(s) fprintf(stderr, "MATCH RLE: %s\n", s);
+#else
+# define MATCH_RLE_DEBUG_LOG(s) ((void) 0);
+#endif
+
 #ifdef USE_MATCH_CACHE
 # define INC_NUM_FAILS msa->num_fails++
 # define MEMOIZE_MATCH_CACHE_POINT do {\
   if (stk->type == STK_MATCH_CACHE_POINT) {\
     if (FORCE_USE_RLE) {\
-      MATCH_CACHE_DEBUG_MEMOIZE_RLE(stkp);\
-      fprintf(stderr, "MATCH RLE: RLE ENTERED\n");\
-      insert_rle_run(&msa->match_cache_rle[stk->u.match_cache_point.cache_point], \
-        stk->u.match_cache_point.input_pos);\
+      MATCH_RLE_DEBUG_LOG("RLE ENTERED")\
+      onig_rle_insert(msa->rle_table, stk->u.match_cache_point.cache_point, stk->u.match_cache_point.input_pos);\
       } else {\
         fprintf(stderr, "MATCH CACHE: BIT VECTOR ENTERED\n");\
         msa->match_cache_buf[stk->u.match_cache_point.index] |= stk->u.match_cache_point.mask;\
-        MATCH_CACHE_DEBUG_MEMOIZE(stkp);\
+        MATCH_CACHE_DEBUG_MEMOIZE(stk);\
       }\
     } else if (stk->type == STK_ATOMIC_MATCH_CACHE_POINT) {\
       fprintf(stderr, "MATCH CACHE: stack type is ATOMIC MATCH POINT\n");\
@@ -2745,16 +2829,17 @@ match_at(regex_t* reg, const UChar* str, const UChar* end,
 // 여기가 문제인거 같다. 
 #  define CHECK_MATCH_CACHE do {\
   if (msa->match_cache_status == MATCH_CACHE_STATUS_ENABLED) {\
+    fprintf(stderr, "MATCH CACHE: Entered CHECK_MATCH_CACHE\n");\
     const OnigCacheOpcode *cache_opcode;\
     long cache_point = find_cache_point(reg, msa->cache_opcodes, msa->num_cache_opcodes, pbegin, stk_base, repeat_stk, &cache_opcode);\
     if (cache_point >= 0) {\
       long input_pos = (long)(s - str);\
       if (FORCE_USE_RLE) {\
-        if (is_rle_cached(&msa->match_cache_rle[cache_point], input_pos)) {\
+        if (onig_rle_is_memoized(msa->rle_table, cache_point, input_pos)) {\
           MATCH_CACHE_RLE_DEBUG_HIT; MATCH_CACHE_HIT;\
           goto fail;\
         } else {\
-          fprintf(stderr, "MISS: input_pos=%ld, cache_point=%ld\n", input_pos, cache_point);\
+          fprintf(stderr, "MATCH RLE: Cache missed at input_pos=%ld, cache_point=%ld\n", input_pos, cache_point);\
         }\
         STACK_PUSH_MATCH_CACHE_POINT_RLE(cache_point, input_pos);\
       } else {\
@@ -3862,13 +3947,13 @@ match_at(regex_t* reg, const UChar* str, const UChar* end,
 	int isnull;
 
 	GET_MEMNUM_INC(mem, p); /* mem: null check id */
-  fprintf(stderr, "Before NULL_CHECK_MEMST: stk=%p, stk-1->null_check=%d\n",
-        stk, (stk-1)->null_check);
+  // fprintf(stderr, "Before NULL_CHECK_MEMST: stk=%p, stk-1->null_check=%d\n",
+        // stk, (stk-1)->null_check);
 	STACK_NULL_CHECK_MEMST(isnull, mem, s, reg);
 	if (isnull) {
 # ifdef ONIG_DEBUG_MATCH
-	  fprintf(stderr, "NULL_CHECK_END_MEMST: skip  id:%d, s:%"PRIuPTR" (%p)\n",
-		  (int )mem, (uintptr_t )s, s);
+	  // fprintf(stderr, "NULL_CHECK_END_MEMST: skip  id:%d, s:%"PRIuPTR" (%p)\n",
+		  // (int )mem, (uintptr_t )s, s);
 # endif
 	  if (isnull == -1) goto fail;
 	  goto null_check_found;
@@ -4267,6 +4352,7 @@ match_at(regex_t* reg, const UChar* str, const UChar* end,
 	MOP_OUT;
       }
       MOP_IN(OP_FAIL);
+      MATCH_RLE_DEBUG_LOG("Right before stack pop");
       STACK_POP;
       p     = stk->u.state.pcode;
       s     = stk->u.state.pstr;
@@ -4303,26 +4389,6 @@ match_at(regex_t* reg, const UChar* str, const UChar* end,
 	  }
 	  msa->cache_opcodes = cache_opcodes;
 
-    
-    // MINSEOK | FORCE_USE_RLE
-    // if (FORCE_USE_RLE) 
-    //   msa->use_rle = 1;
-    // else 
-    //   msa->use_rle = 0;
-    
-    // MINSEOK | Dinamic Use of RLE
-    // fprintf(stderr, "MATCH CACHE: cache_points = %d, input_len = %ld, product = %ld\n",
-    //     msa->num_cache_points, (end - str),
-    //     (long)msa->num_cache_points * (end - str));
-    // if (msa->num_cache_points * (end - str) < RLE_SWITCH_THRESHOLD) {
-    //   fprintf(stderr, "MATCH CACHE: RLE SWITCH IS OFF\n");
-    //   msa->use_rle = 0;
-    // }
-    // else {
-    //   fprintf(stderr, "MATCH CACHE: RLE SWITCH IS ON\n");
-    //   msa->use_rle = 1;
-    // }
-
 #ifdef ONIG_DEBUG_MATCH_CACHE
 	  fprintf(stderr, "MATCH CACHE: #cache opcodes = %ld\n", msa->num_cache_opcodes);
 	  fprintf(stderr, "MATCH CACHE: #cache points = %ld\n", msa->num_cache_points);
@@ -4354,19 +4420,22 @@ match_at(regex_t* reg, const UChar* str, const UChar* end,
     total_bitvector_bytes += (match_cache_buf_length * sizeof(uint8_t));                        // MINSEOK | Collecting bitvector memory usage
 	  msa->match_cache_buf = match_cache_buf;
 	}
-  if (FORCE_USE_RLE && msa->match_cache_rle == NULL) {
-    OnigMatchRunList* rle_table = (OnigMatchRunList*)
-        xmalloc(sizeof(OnigMatchRunList) * msa->num_cache_points);
+  if (FORCE_USE_RLE && msa->rle_table == NULL) {
+  #ifdef ONIG_DEBUG_RLE
+    fprintf(stderr, "MATCH RLE: Initially allocating RLE table\n");
+  #endif
+    OnigMemoRLETable* rle_table = (OnigMemoRLETable*)xmalloc(sizeof(OnigMemoRLETable));
     if (rle_table == NULL) {
       return ONIGERR_MEMORY;
     }
 
-    for (long i = 0; i < msa->num_cache_points; i++) {
-      init_match_run_list(&rle_table[i]);
+    onig_rle_table_init(rle_table);
+    if (rle_table->entries == NULL) {
+      xfree(rle_table);
+      return ONIGERR_MEMORY;
     }
 
-    msa->match_cache_rle = rle_table;
-    total_rle_bytes += msa->num_cache_points * sizeof(OnigMatchRunList);  // MINSEOK | Collecting RLE implementation memory usage
+    msa->rle_table = rle_table;
   }
       }
       fail_match_cache:
@@ -5878,3 +5947,8 @@ onig_copy_encoding(OnigEncodingType *to, OnigEncoding from)
 {
   *to = *from;
 }
+
+
+
+
+
