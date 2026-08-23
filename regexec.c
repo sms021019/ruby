@@ -1066,6 +1066,9 @@ onig_region_copy(OnigRegion* to, const OnigRegion* from)
 #define STK_ABSENT                   0x0c00  /* absent inner loop marker */
 #define STK_MATCH_CACHE_POINT        0x0d00  /* for the match cache optimization */
 #define STK_ATOMIC_MATCH_CACHE_POINT 0x0e00
+#ifdef USE_MATCH_CACHE_RLE
+#define STK_MATCH_CACHE_POINT_RLE    0x0f00  /* match cache point while the cache is run-length encoded */
+#endif
 
 /* stack type check mask */
 #define STK_MASK_POP_USED            0x00ff
@@ -1080,16 +1083,191 @@ onig_region_copy(OnigRegion* to, const OnigRegion* from)
   (msa).cache_opcodes = (OnigCacheOpcode*)NULL;\
   (msa).num_cache_points = 0;\
   (msa).match_cache_buf = (uint8_t*)NULL;\
+  MATCH_ARG_INIT_MATCH_CACHE_RLE(msa);\
 } while(0)
 #define MATCH_ARG_FREE_MATCH_CACHE(msa) do {\
   xfree((msa).cache_opcodes);\
   xfree((msa).match_cache_buf);\
+  MATCH_ARG_FREE_MATCH_CACHE_RLE(msa);\
   (msa).cache_opcodes = (OnigCacheOpcode*)NULL;\
   (msa).match_cache_buf = (uint8_t*)NULL;\
 } while(0)
 #else
 #define MATCH_ARG_INIT_MATCH_CACHE(msa)
 #define MATCH_ARG_FREE_MATCH_CACHE(msa)
+#endif
+
+#ifdef USE_MATCH_CACHE_RLE
+#define MATCH_ARG_INIT_MATCH_CACHE_RLE(msa) do {\
+  (msa).match_cache_buf_length = 0;\
+  (msa).match_cache_rle_bytes = 0;\
+  (msa).match_cache_runs = (OnigMatchCacheRunList*)NULL;\
+} while(0)
+#define MATCH_ARG_FREE_MATCH_CACHE_RLE(msa) do {\
+  match_cache_runs_free((msa).match_cache_runs, (msa).num_cache_points);\
+  (msa).match_cache_runs = (OnigMatchCacheRunList*)NULL;\
+} while(0)
+
+#define MATCH_CACHE_RUN_LIST_INITIAL_CAPACITY 4
+
+static void
+match_cache_runs_free(OnigMatchCacheRunList* lists, long num_cache_points)
+{
+  long i;
+  if (lists == NULL) return;
+  for (i = 0; i < num_cache_points; i++) {
+    xfree(lists[i].runs);
+  }
+  xfree(lists);
+}
+
+/* Returns the index of the first run whose end >= pos (count if none). */
+static inline long
+match_cache_runs_lower_bound(const OnigMatchCacheRunList* list, long pos)
+{
+  long lo = 0, hi = list->count;
+  while (lo < hi) {
+    long mid = lo + ((hi - lo) >> 1);
+    if (list->runs[mid].end < pos) lo = mid + 1;
+    else hi = mid;
+  }
+  return lo;
+}
+
+static inline int
+match_cache_runs_contains(const OnigMatchCacheRunList* list, long pos)
+{
+  long i = match_cache_runs_lower_bound(list, pos);
+  return i < list->count && list->runs[i].start <= pos;
+}
+
+/* Inserts pos into list, coalescing with neighbouring runs.
+   Returns 1 on success, 0 on allocation failure or when growing the list
+   would make the RLE representation exceed the bitmap size (the caller
+   then converts to the bitmap). *rle_bytes is kept in sync. */
+static int
+match_cache_runs_insert(OnigMatchCacheRunList* list, long pos,
+                        size_t* rle_bytes, size_t rle_bytes_limit)
+{
+  long i = match_cache_runs_lower_bound(list, pos);
+  OnigMatchCacheRun* runs = list->runs;
+
+  if (i < list->count && runs[i].start <= pos) {
+    return 1; /* already memoized */
+  }
+  if (i < list->count && runs[i].start == pos + 1) {
+    /* extend the following run backward, merging with the previous run
+       if they become adjacent */
+    runs[i].start = pos;
+    if (i > 0 && runs[i - 1].end + 1 == pos) {
+      runs[i - 1].end = runs[i].end;
+      xmemmove(&runs[i], &runs[i + 1], sizeof(OnigMatchCacheRun) * (list->count - i - 1));
+      list->count--;
+    }
+    return 1;
+  }
+  if (i > 0 && runs[i - 1].end + 1 == pos) {
+    runs[i - 1].end = pos;
+    return 1;
+  }
+
+  /* a new run is needed at index i */
+  if (list->count == list->capacity) {
+    long new_capacity = list->capacity == 0 ? MATCH_CACHE_RUN_LIST_INITIAL_CAPACITY : list->capacity * 2;
+    size_t grow = (size_t)(new_capacity - list->capacity) * sizeof(OnigMatchCacheRun);
+    OnigMatchCacheRun* new_runs;
+    if (*rle_bytes + grow > rle_bytes_limit) {
+      return 0;
+    }
+    new_runs = (OnigMatchCacheRun*)xrealloc(runs, sizeof(OnigMatchCacheRun) * new_capacity);
+    if (new_runs == NULL) {
+      return 0;
+    }
+    list->runs = runs = new_runs;
+    list->capacity = new_capacity;
+    *rle_bytes += grow;
+  }
+  xmemmove(&runs[i + 1], &runs[i], sizeof(OnigMatchCacheRun) * (list->count - i));
+  runs[i].start = runs[i].end = pos;
+  list->count++;
+  return 1;
+}
+
+/* Switches msa from RLE mode to bitmap mode, replaying every memoized
+   position into a freshly allocated bitmap. On allocation failure the
+   cache is disabled for the rest of the match. */
+static void
+match_cache_convert_to_bitmap(OnigMatchArg* msa)
+{
+  long cp;
+  uint8_t* buf = (uint8_t*)xmalloc(msa->match_cache_buf_length);
+  if (buf == NULL) {
+    msa->match_cache_status = MATCH_CACHE_STATUS_DISABLED;
+  }
+  else {
+    xmemset(buf, 0, msa->match_cache_buf_length);
+    for (cp = 0; cp < msa->num_cache_points; cp++) {
+      const OnigMatchCacheRunList* list = &msa->match_cache_runs[cp];
+      long i, pos;
+      for (i = 0; i < list->count; i++) {
+        for (pos = list->runs[i].start; pos <= list->runs[i].end; pos++) {
+          long point = msa->num_cache_points * pos + cp;
+          buf[point >> 3] |= (uint8_t)(1 << (point & 7));
+        }
+      }
+    }
+    msa->match_cache_buf = buf;
+    msa->match_cache_status = MATCH_CACHE_STATUS_ENABLED;
+  }
+  match_cache_runs_free(msa->match_cache_runs, msa->num_cache_points);
+  msa->match_cache_runs = NULL;
+  msa->match_cache_rle_bytes = 0;
+}
+
+/* Memoizes a stack entry that was pushed while the cache was in RLE mode.
+   If the cache has since been converted to the bitmap (or disabled), the
+   entry is recorded there instead. Converting happens here when the RLE
+   representation would outgrow the bitmap. */
+static inline void
+match_cache_memoize_rle_entry(OnigMatchArg* msa, long cache_point, long pos)
+{
+  if (msa->match_cache_status == MATCH_CACHE_STATUS_ENABLED_RLE) {
+    if (match_cache_runs_insert(&msa->match_cache_runs[cache_point], pos,
+                                &msa->match_cache_rle_bytes, msa->match_cache_buf_length)) {
+      return;
+    }
+    match_cache_convert_to_bitmap(msa);
+  }
+  if (msa->match_cache_buf != NULL) {
+    long point = msa->num_cache_points * pos + cache_point;
+    msa->match_cache_buf[point >> 3] |= (uint8_t)(1 << (point & 7));
+  }
+}
+
+#define MATCH_CACHE_RLE_NOT_ALLOCATED(msa) ((msa)->match_cache_runs == NULL)
+
+/* The RLE representation is used only when every cache point is a plain
+   one (no lookaround or atomic group involved, which need the extended
+   two-bit encoding of the bitmap) and when its fixed overhead is smaller
+   than the bitmap it replaces. */
+static int
+match_cache_rle_is_applicable(const OnigMatchArg* msa, size_t match_cache_buf_length)
+{
+  long i;
+  size_t runs_length = (size_t)msa->num_cache_points * sizeof(OnigMatchCacheRunList);
+  if (msa->num_cache_points <= 0) return 0;
+  if (runs_length / sizeof(OnigMatchCacheRunList) != (size_t)msa->num_cache_points) return 0;
+  if (match_cache_buf_length < MATCH_CACHE_RLE_THRESHOLD) return 0;
+  if (runs_length + MATCH_CACHE_RUN_LIST_INITIAL_CAPACITY * sizeof(OnigMatchCacheRun) >= match_cache_buf_length) return 0;
+  for (i = 0; i < msa->num_cache_opcodes; i++) {
+    if (msa->cache_opcodes[i].lookaround_nesting != 0) return 0;
+  }
+  return 1;
+}
+#else
+#define MATCH_ARG_INIT_MATCH_CACHE_RLE(msa) ((void) 0)
+#define MATCH_ARG_FREE_MATCH_CACHE_RLE(msa) ((void) 0)
+#define MATCH_CACHE_RLE_NOT_ALLOCATED(msa) 1
 #endif
 
 #ifdef USE_FIND_LONGEST_SEARCH_ALL_OF_RANGE
@@ -1528,6 +1706,27 @@ stack_double(OnigStackType** arg_stk_base, OnigStackType** arg_stk_end,
 # define MATCH_CACHE_DEBUG_MEMOIZE(stkp) ((void) 0)
 #endif
 
+#ifdef USE_MATCH_CACHE_RLE
+/* Entries pushed while the cache is in RLE mode have their own stack type,
+   so the bitmap path below stays exactly as it is without RLE. RLE mode is
+   only selected when no cache opcode is inside a lookaround or atomic
+   group, so extended memoization never sees an RLE entry. */
+# define STACK_PUSH_MATCH_CACHE_POINT_RLE(cp, position) do {\
+  STACK_ENSURE(1);\
+  stk->type = STK_MATCH_CACHE_POINT_RLE;\
+  stk->null_check = stk == stk_base ? 0 : (stk-1)->null_check;\
+  stk->u.match_cache_point.cache_point = (cp);\
+  stk->u.match_cache_point.pos = (position);\
+  STACK_INC;\
+} while(0)
+# define MEMOIZE_MATCH_CACHE_POINT_RLE_ELSE \
+    else if (stk->type == STK_MATCH_CACHE_POINT_RLE) {\
+      match_cache_memoize_rle_entry(msa, stk->u.match_cache_point.cache_point, stk->u.match_cache_point.pos);\
+    }
+#else
+# define MEMOIZE_MATCH_CACHE_POINT_RLE_ELSE
+#endif
+
 #ifdef USE_MATCH_CACHE
 # define INC_NUM_FAILS msa->num_fails++
 # define MEMOIZE_MATCH_CACHE_POINT do {\
@@ -1539,6 +1738,7 @@ stack_double(OnigStackType** arg_stk_base, OnigStackType** arg_stk_end,
       memoize_extended_match_cache_point(msa->match_cache_buf, stk->u.match_cache_point.index, stk->u.match_cache_point.mask);\
       MATCH_CACHE_DEBUG_MEMOIZE(stkp);\
     }\
+    MEMOIZE_MATCH_CACHE_POINT_RLE_ELSE\
   } while(0)
 # define MEMOIZE_LOOKAROUND_MATCH_CACHE_POINT(stkp) do {\
     if (stkp->type == STK_MATCH_CACHE_POINT) {\
@@ -2623,6 +2823,27 @@ match_at(regex_t* reg, const UChar* str, const UChar* end,
 
 #define MATCH_CACHE_HIT ((void) 0)
 
+#ifdef USE_MATCH_CACHE_RLE
+/* Appended to the bitmap branch of CHECK_MATCH_CACHE as an else-if, so the
+   bitmap path is unchanged. All cache opcodes have lookaround_nesting == 0
+   when RLE mode is selected, so a hit is always a plain failure. */
+#  define CHECK_MATCH_CACHE_RLE_ELSE \
+  else if (msa->match_cache_status == MATCH_CACHE_STATUS_ENABLED_RLE) {\
+    const OnigCacheOpcode *cache_opcode;\
+    long cache_point = find_cache_point(reg, msa->cache_opcodes, msa->num_cache_opcodes, pbegin, stk_base, repeat_stk, &cache_opcode);\
+    if (cache_point >= 0) {\
+      long match_cache_pos = (long)(s - str);\
+      if (match_cache_runs_contains(&msa->match_cache_runs[cache_point], match_cache_pos)) {\
+        MATCH_CACHE_DEBUG_HIT; MATCH_CACHE_HIT;\
+        goto fail;\
+      }\
+      STACK_PUSH_MATCH_CACHE_POINT_RLE(cache_point, match_cache_pos);\
+    }\
+  }
+#else
+#  define CHECK_MATCH_CACHE_RLE_ELSE
+#endif
+
 #  define CHECK_MATCH_CACHE do {\
   if (msa->match_cache_status == MATCH_CACHE_STATUS_ENABLED) {\
     const OnigCacheOpcode *cache_opcode;\
@@ -2654,6 +2875,7 @@ match_at(regex_t* reg, const UChar* str, const UChar* end,
       STACK_PUSH_MATCH_CACHE_POINT(match_cache_point_index, match_cache_point_mask);\
     }\
   }\
+  CHECK_MATCH_CACHE_RLE_ELSE\
 } while (0)
 #else
 #  define CHECK_MATCH_CACHE ((void) 0)
@@ -4165,7 +4387,7 @@ match_at(regex_t* reg, const UChar* str, const UChar* end,
           }
 #endif
         }
-        if (msa->match_cache_buf == NULL) {
+        if (msa->match_cache_buf == NULL && MATCH_CACHE_RLE_NOT_ALLOCATED(msa)) {
           size_t length = (end - str) + 1;
           size_t num_match_cache_points = (size_t)msa->num_cache_points * length;
 #ifdef ONIG_DEBUG_MATCH_CACHE
@@ -4179,6 +4401,21 @@ match_at(regex_t* reg, const UChar* str, const UChar* end,
             return ONIGERR_MEMORY;
           }
           size_t match_cache_buf_length = (num_match_cache_points >> 3) + (num_match_cache_points & 7 ? 1 : 0) + 1;
+#ifdef USE_MATCH_CACHE_RLE
+          msa->match_cache_buf_length = match_cache_buf_length;
+          if (match_cache_rle_is_applicable(msa, match_cache_buf_length)) {
+            size_t runs_length = (size_t)msa->num_cache_points * sizeof(OnigMatchCacheRunList);
+            OnigMatchCacheRunList* runs = (OnigMatchCacheRunList*)xmalloc(runs_length);
+            if (runs == NULL) {
+              return ONIGERR_MEMORY;
+            }
+            xmemset(runs, 0, runs_length);
+            msa->match_cache_runs = runs;
+            msa->match_cache_rle_bytes = runs_length;
+            msa->match_cache_status = MATCH_CACHE_STATUS_ENABLED_RLE;
+            goto fail_match_cache;
+          }
+#endif
           uint8_t* match_cache_buf = (uint8_t*)xmalloc(match_cache_buf_length * sizeof(uint8_t));
           if (match_cache_buf == NULL) {
             return ONIGERR_MEMORY;

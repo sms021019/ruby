@@ -45,6 +45,17 @@
 /* enable the match optimization by using a cache. */
 #define USE_MATCH_CACHE
 
+/* store the match cache as run-length encoded intervals when that is
+   smaller than the bitmap; falls back to the bitmap otherwise. */
+#ifdef USE_MATCH_CACHE
+# define USE_MATCH_CACHE_RLE
+/* the bitmap is kept when it would be smaller than this many bytes;
+   below it the bitmap is cheap and its O(1) lookup is faster. */
+# ifndef MATCH_CACHE_RLE_THRESHOLD
+#  define MATCH_CACHE_RLE_THRESHOLD (1024 * 1024)
+# endif
+#endif
+
 #if defined(ONIG_DEBUG_PARSE_TREE) || defined(ONIG_DEBUG_MATCH) || \
     defined(ONIG_DEBUG_SEARCH) || defined(ONIG_DEBUG_COMPILE) || \
     defined(ONIG_DEBUG_STATISTICS) || defined(ONIG_DEBUG_MEMLEAK)
@@ -863,6 +874,10 @@ typedef struct _OnigStackType {
     struct {
       long    index;      /* index of the match cache buffer */
       uint8_t mask;       /* bit-mask for the match cache buffer */
+#ifdef USE_MATCH_CACHE_RLE
+      long    cache_point; /* STK_MATCH_CACHE_POINT_RLE: cache point */
+      long    pos;         /* STK_MATCH_CACHE_POINT_RLE: byte offset into the subject */
+#endif
     } match_cache_point;
 #endif
   } u;
@@ -878,6 +893,21 @@ typedef struct {
   int lookaround_nesting;
   UChar *match_addr;
 } OnigCacheOpcode;
+
+#ifdef USE_MATCH_CACHE_RLE
+/* A closed interval [start, end] of byte offsets memoized for one cache point. */
+typedef struct {
+  long start;
+  long end;
+} OnigMatchCacheRun;
+
+/* Sorted, non-overlapping, non-adjacent runs for one cache point. */
+typedef struct {
+  long count;
+  long capacity;
+  OnigMatchCacheRun* runs;
+} OnigMatchCacheRunList;
+#endif
 #endif
 
 typedef struct {
@@ -909,6 +939,11 @@ typedef struct {
   OnigCacheOpcode* cache_opcodes;
   long             num_cache_points;
   uint8_t*         match_cache_buf;
+#ifdef USE_MATCH_CACHE_RLE
+  size_t           match_cache_buf_length; /* bytes the bitmap would need */
+  size_t           match_cache_rle_bytes;  /* bytes currently held by run lists */
+  OnigMatchCacheRunList* match_cache_runs;  /* num_cache_points entries, RLE mode only */
+#endif
 #endif
 } OnigMatchArg;
 
@@ -919,6 +954,9 @@ typedef struct {
 #define MATCH_CACHE_STATUS_INIT      2
 #define MATCH_CACHE_STATUS_DISABLED -1
 #define MATCH_CACHE_STATUS_ENABLED   0
+#ifdef USE_MATCH_CACHE_RLE
+#define MATCH_CACHE_STATUS_ENABLED_RLE 3  /* enabled, positions kept as run lists */
+#endif
 
 #define IS_CODE_SB_WORD(enc,code) \
   (ONIGENC_IS_CODE_ASCII(code) && ONIGENC_IS_CODE_WORD(enc,code))
