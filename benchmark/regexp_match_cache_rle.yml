@@ -1,0 +1,28 @@
+# Match cache benchmarks: classic ReDoS patterns whose bitmap stays below
+# MATCH_CACHE_RLE_THRESHOLD, a pattern with many cache points whose bitmap
+# would be 125 MB (run-length encoded cache), and adversarial inputs whose
+# memoized positions are isolated (run lists fall back to the bitmap).
+#
+#   benchmark-driver benchmark/regexp_match_cache_rle.yml -e master::ruby -e rle::./ruby --repeat-count 10
+prelude: |
+  Regexp.timeout = 120
+  ASTAR_1E5 = "a" * 100_000 + "x"
+  ASTAR_1E6 = "a" * 1_000_000 + "x"
+  ASTAR_4E6 = "a" * 4_000_000 + "x"
+  AAQ_1E5 = "a" * 100_000 + "x"
+  AAQ_1E6 = "a" * 1_000_000 + "x"
+  MANY_CP_1E6 = "a" * 1_000_000 + "yx"
+  ADV_ABAB_1E5 = "ab" * 50_000 + "xc"
+  ADV_ABAB_4E6 = "ab" * 2_100_000 + "xc"
+  ADV_REP_4E4 = "ab" * 20_000 + "xc"
+benchmark:
+  astar_1e5:   "/^(a*)*$/.match?(ASTAR_1E5)"        # bitmap 25 KB
+  astar_1e6:   "/^(a*)*$/.match?(ASTAR_1E6)"        # bitmap 250 KB
+  astar_4e6:   "/^(a*)*$/.match?(ASTAR_4E6)"        # bitmap 1 MB
+  aaq_1e5:     "/(a|a?)+$/.match?(AAQ_1E5)"         # bitmap 62 KB
+  aaq_1e6:     "/(a|a?)+$/.match?(AAQ_1E6)"         # bitmap 625 KB
+  many_cp_1e6: "/^(?:a|aa){1,500}x/.match?(MANY_CP_1E6)"        # 999 cache points, bitmap 125 MB
+  adv_abab_1e5: "/^(?:ab|abab)*c/.match?(ADV_ABAB_1E5)"         # bitmap 25 KB
+  adv_abab_4e6: "/^(?:ab|abab)*c/.match?(ADV_ABAB_4E6)"         # bitmap 1 MB, falls back mid-match
+  adv_rep_4e4: "/^(?:ab|abab){1,300}c/.match?(ADV_REP_4E4)"     # 599 cache points, bitmap 3 MB
+loop_count: 3

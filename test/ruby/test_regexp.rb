@@ -2275,6 +2275,77 @@ class TestRegexp < Test::Unit::TestCase
     end;
   end
 
+  # The run-length encoded match cache is selected when the bitmap would be
+  # at least MATCH_CACHE_RLE_THRESHOLD (1 MB by default) bytes. Patterns with
+  # a bounded repeat have many cache points (/(?:a|aa){1,500}/ has 999), so a
+  # 10 KB input is enough to exceed the threshold.
+  def test_match_cache_rle_many_cache_points
+    assert_separately([], "#{<<-"begin;"}\n#{<<-'end;'}")
+      timeout = #{ EnvUtil.apply_timeout_scale(10).inspect }
+    begin;
+      Regexp.timeout = timeout
+      assert_equal(false, /^(?:a|aa){1,500}x/.match?("a" * 10_000 + "yx"))
+      assert_equal(true, /^(?:a|aa){1,6000}x/.match?("a" * 10_000 + "x"))
+      assert_equal(6_000, /^(?:a|aa){1,6000}/.match("a" * 10_000 + "yx")[0].size)
+    end;
+  end
+
+  def test_match_cache_rle_exponential
+    assert_separately([], "#{<<-"begin;"}\n#{<<-'end;'}")
+      timeout = #{ EnvUtil.apply_timeout_scale(10).inspect }
+    begin;
+      Regexp.timeout = timeout
+      # 2 cache points: the bitmap reaches 1 MB at about 4 M characters
+      assert_nil(/^(a*)*$/ =~ "a" * 4_200_000 + "x")
+      assert_equal(2_000_001, /(a|a?)+$/ =~ "a" * 2_000_000 + "x")
+    end;
+  end
+
+  # Cache opcodes of /^(?:ab|abab)*c/ are reached only at even offsets, so
+  # every memoized position is an isolated interval and the run lists outgrow
+  # the bitmap; the cache must switch to the bitmap mid-match and still give
+  # the right answer.
+  def test_match_cache_rle_fallback_to_bitmap
+    assert_separately([], "#{<<-"begin;"}\n#{<<-'end;'}")
+      timeout = #{ EnvUtil.apply_timeout_scale(10).inspect }
+    begin;
+      Regexp.timeout = timeout
+      assert_equal(false, /^(?:ab|abab)*c/.match?("ab" * 2_100_000 + "xc"))
+      assert_equal(true, /^(?:ab|abab)*c/.match?("ab" * 2_100_000 + "c"))
+    end;
+  end
+
+  # Intervals are byte offsets; with multibyte characters adjacent positions
+  # are not adjacent bytes, which also drives the run lists into the fallback.
+  def test_match_cache_rle_multibyte
+    assert_separately([], "#{<<-"begin;"}\n#{<<-'end;'}")
+      timeout = #{ EnvUtil.apply_timeout_scale(10).inspect }
+    begin;
+      Regexp.timeout = timeout
+      re = Regexp.new("^(?:a|aa){1,500}x".encode("UTF-16LE"))
+      assert_equal(false, re.match?(("a" * 10_000 + "yx").encode("UTF-16LE")))
+      assert_equal(true, re.match?(("a" * 600 + "x").encode("UTF-16LE")))
+      re = Regexp.new("^(?:\u3042|\u3042\u3042){1,500}x".encode("EUC-JP"))
+      assert_equal(false, re.match?(("\u3042" * 10_000 + "yx").encode("EUC-JP")))
+      assert_equal(false, /^(?:\u3042|\u3042\u3042){1,500}x/.match?("\u3042" * 10_000 + "yx"))
+      assert_equal(true, /^(?:\u3042|\u3042\u3042){1,500}x/.match?("\u3042" * 600 + "x"))
+    end;
+  end
+
+  # With the bitmap alone this match needs 999 * 10**8 bits (12.5 GB) and
+  # raises RegexpError ("failed to allocate memory") under a 4 GB address
+  # space limit.
+  def test_match_cache_rle_allocation_failure
+    omit "needs RLIMIT_AS" unless Process.const_defined?(:RLIMIT_AS) && RUBY_PLATFORM =~ /linux/
+    assert_separately([], "#{<<-"begin;"}\n#{<<-'end;'}")
+      timeout = #{ EnvUtil.apply_timeout_scale(30).inspect }
+    begin;
+      Regexp.timeout = timeout
+      Process.setrlimit(:AS, 4_000_000_000)
+      assert_equal(false, /^(?:a|aa){1,500}x/.match?("a" * 100_000_000 + "yx"))
+    end;
+  end
+
   def test_cache_opcodes_initialize
     str = 'test1-test2-test3-test4-test_5'
     re = '^([0-9a-zA-Z\-/]*){1,256}$'
