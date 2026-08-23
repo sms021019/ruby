@@ -864,6 +864,10 @@ typedef struct _OnigStackType {
       long    index;      /* index of the match cache buffer */
       uint8_t mask;       /* bit-mask for the match cache buffer */
     } match_cache_point;
+    struct {
+      long    cache_point;  /* cache point (RLE match cache) */
+      long    pos;          /* byte position on input string */
+    } rle_match_cache_point;
 #endif
   } u;
 } OnigStackType;
@@ -878,6 +882,21 @@ typedef struct {
   int lookaround_nesting;
   UChar *match_addr;
 } OnigCacheOpcode;
+
+#define USE_MATCH_CACHE_RLE
+/* A run of memoized positions [start, end) (byte offsets) for one cache point. */
+typedef struct {
+  long start;
+  long end;
+} OnigMatchCacheRun;
+
+/* Sorted, non-overlapping, non-adjacent runs for one cache point. */
+typedef struct {
+  OnigMatchCacheRun* runs;
+  long num;
+  long cap;
+  long hint;  /* index of the most recently touched run (fast path) */
+} OnigMatchCacheRunList;
 #endif
 
 typedef struct {
@@ -909,6 +928,12 @@ typedef struct {
   OnigCacheOpcode* cache_opcodes;
   long             num_cache_points;
   uint8_t*         match_cache_buf;
+  /* RLE match cache: indexed by cache point; NULL means bitmap mode. */
+  OnigMatchCacheRunList* match_cache_runs;
+  size_t           match_cache_bitmap_bytes;  /* size of the bitmap (also the RLE byte budget) */
+  size_t           match_cache_rle_bytes;     /* bytes currently held by RLE structures */
+  size_t           match_cache_rle_peak_bytes;
+  int              match_cache_mode;          /* 0: none, 1: bitmap, 2: rle, 3: rle->bitmap */
 #endif
 } OnigMatchArg;
 

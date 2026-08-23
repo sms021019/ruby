@@ -1066,6 +1066,7 @@ onig_region_copy(OnigRegion* to, const OnigRegion* from)
 #define STK_ABSENT                   0x0c00  /* absent inner loop marker */
 #define STK_MATCH_CACHE_POINT        0x0d00  /* for the match cache optimization */
 #define STK_ATOMIC_MATCH_CACHE_POINT 0x0e00
+#define STK_RLE_MATCH_CACHE_POINT    0x0f00  /* for the RLE match cache */
 
 /* stack type check mask */
 #define STK_MASK_POP_USED            0x00ff
@@ -1080,10 +1081,19 @@ onig_region_copy(OnigRegion* to, const OnigRegion* from)
   (msa).cache_opcodes = (OnigCacheOpcode*)NULL;\
   (msa).num_cache_points = 0;\
   (msa).match_cache_buf = (uint8_t*)NULL;\
+  (msa).match_cache_runs = (OnigMatchCacheRunList*)NULL;\
+  (msa).match_cache_bitmap_bytes = 0;\
+  (msa).match_cache_rle_bytes = 0;\
+  (msa).match_cache_rle_peak_bytes = 0;\
+  (msa).match_cache_mode = 0;\
 } while(0)
+static void match_cache_free_runs(OnigMatchArg* msa);
+static void match_cache_report_stats(OnigMatchArg* msa);
 #define MATCH_ARG_FREE_MATCH_CACHE(msa) do {\
+  if ((msa).match_cache_mode != 0) match_cache_report_stats(&(msa));\
   xfree((msa).cache_opcodes);\
   xfree((msa).match_cache_buf);\
+  match_cache_free_runs(&(msa));\
   (msa).cache_opcodes = (OnigCacheOpcode*)NULL;\
   (msa).match_cache_buf = (uint8_t*)NULL;\
 } while(0)
@@ -1511,6 +1521,15 @@ stack_double(OnigStackType** arg_stk_base, OnigStackType** arg_stk_end,
   STACK_INC;\
 } while(0)
 
+#define STACK_PUSH_RLE_MATCH_CACHE_POINT(cp, position) do {\
+  STACK_ENSURE(1);\
+  stk->type = STK_RLE_MATCH_CACHE_POINT;\
+  stk->null_check = stk == stk_base ? 0 : (stk-1)->null_check;\
+  stk->u.rle_match_cache_point.cache_point = (cp);\
+  stk->u.rle_match_cache_point.pos = (position);\
+  STACK_INC;\
+} while(0)
+
 
 #ifdef ONIG_DEBUG
 # define STACK_BASE_CHECK(p, at) \
@@ -1538,6 +1557,9 @@ stack_double(OnigStackType** arg_stk_base, OnigStackType** arg_stk_end,
     else if (stk->type == STK_ATOMIC_MATCH_CACHE_POINT) {\
       memoize_extended_match_cache_point(msa->match_cache_buf, stk->u.match_cache_point.index, stk->u.match_cache_point.mask);\
       MATCH_CACHE_DEBUG_MEMOIZE(stkp);\
+    }\
+    else if (stk->type == STK_RLE_MATCH_CACHE_POINT) {\
+      match_cache_rle_memoize(msa, stk->u.rle_match_cache_point.cache_point, stk->u.rle_match_cache_point.pos);\
     }\
   } while(0)
 # define MEMOIZE_LOOKAROUND_MATCH_CACHE_POINT(stkp) do {\
@@ -2208,6 +2230,7 @@ stack_type_str(int stack_type)
     case STK_ABSENT_POS:	return "AbsPos";
     case STK_ABSENT:		return "Absent";
     case STK_MATCH_CACHE_POINT:	return "MCache";
+    case STK_RLE_MATCH_CACHE_POINT:	return "RCache";
     default:			return "      ";
   }
 }
@@ -2300,6 +2323,192 @@ memoize_extended_match_cache_point(uint8_t *match_cache_buf, long match_cache_po
   }
   else {
     match_cache_buf[match_cache_point_index] |= match_cache_point_mask << 1;
+  }
+}
+
+static void
+match_cache_free_runs(OnigMatchArg* msa)
+{
+  if (msa->match_cache_runs != NULL) {
+    long i;
+    for (i = 0; i < msa->num_cache_points; i++) {
+      xfree(msa->match_cache_runs[i].runs);
+    }
+    xfree(msa->match_cache_runs);
+    msa->match_cache_runs = NULL;
+  }
+}
+
+/* Temporary instrumentation: ONIG_MATCH_CACHE_STATS=1 prints cache sizes on free. */
+static int match_cache_stats_enabled = -1;
+static int match_cache_rle_enabled = -1;
+
+static void
+match_cache_report_stats(OnigMatchArg* msa)
+{
+  static const char* mode_names[] = { "none", "bitmap", "rle", "rle->bitmap" };
+  if (match_cache_stats_enabled < 0) {
+    match_cache_stats_enabled = getenv("ONIG_MATCH_CACHE_STATS") != NULL;
+  }
+  if (match_cache_stats_enabled) {
+    long i, nested = 0;
+    for (i = 0; i < msa->num_cache_opcodes; i++) {
+      if (msa->cache_opcodes[i].lookaround_nesting != 0) nested++;
+    }
+    fprintf(stderr, "MATCH CACHE STATS: mode=%s points=%ld opcodes=%ld nested_opcodes=%ld bitmap_bytes=%zu rle_bytes=%zu rle_peak_bytes=%zu\n",
+            mode_names[msa->match_cache_mode], msa->num_cache_points, msa->num_cache_opcodes, nested,
+            msa->match_cache_bitmap_bytes, msa->match_cache_rle_bytes, msa->match_cache_rle_peak_bytes);
+  }
+}
+
+#ifndef MATCH_CACHE_RLE_HINT
+# define MATCH_CACHE_RLE_HINT 1
+#endif
+
+/* Returns 1 if `pos` is memoized for the cache point's run list. */
+static inline int
+match_cache_rle_check(OnigMatchCacheRunList* list, long pos)
+{
+  const OnigMatchCacheRun* runs = list->runs;
+  long lo = 0, hi = list->num;
+#if MATCH_CACHE_RLE_HINT
+  long h = list->hint;
+  if (h < hi) {
+    /* Fast path: the position falls in or right after the last touched run. */
+    if (runs[h].start <= pos) {
+      if (pos < runs[h].end) return 1;
+      if (h + 1 == hi || pos < runs[h + 1].start) return 0;
+    }
+    else if (h == 0) return 0;
+  }
+#endif
+  while (lo < hi) {
+    long mid = lo + ((hi - lo) >> 1);
+    if (runs[mid].start <= pos) lo = mid + 1;
+    else hi = mid;
+  }
+#if MATCH_CACHE_RLE_HINT
+  if (lo > 0) list->hint = lo - 1;
+#endif
+  return lo > 0 && runs[lo - 1].end > pos;
+}
+
+/* Replay the run lists into a freshly allocated bitmap and drop the runs. */
+static void
+match_cache_rle_to_bitmap(OnigMatchArg* msa)
+{
+  size_t bytes = msa->match_cache_bitmap_bytes;
+  long num_cache_points = msa->num_cache_points;
+  long cp;
+  uint8_t* buf = (uint8_t*)xmalloc(bytes);
+  if (buf == NULL) {
+    /* Give up switching; keep RLE and stop checking the budget. */
+    msa->match_cache_bitmap_bytes = (size_t)-1;
+    return;
+  }
+  xmemset(buf, 0, bytes);
+  for (cp = 0; cp < num_cache_points; cp++) {
+    const OnigMatchCacheRunList* list = &msa->match_cache_runs[cp];
+    long i;
+    for (i = 0; i < list->num; i++) {
+      long pos;
+      for (pos = list->runs[i].start; pos < list->runs[i].end; pos++) {
+        long mcp = num_cache_points * pos + cp;
+        buf[mcp >> 3] |= (uint8_t)(1 << (mcp & 7));
+      }
+    }
+  }
+  match_cache_free_runs(msa);
+  msa->match_cache_buf = buf;
+  msa->match_cache_mode = 3;
+}
+
+static void
+match_cache_rle_memoize(OnigMatchArg* msa, long cache_point, long pos)
+{
+  OnigMatchCacheRunList* list;
+  OnigMatchCacheRun* runs;
+  long lo, hi, num;
+
+  if (msa->match_cache_runs == NULL) {
+    /* The cache switched to the bitmap after this point was pushed. */
+    if (msa->match_cache_buf != NULL) {
+      long mcp = msa->num_cache_points * pos + cache_point;
+      msa->match_cache_buf[mcp >> 3] |= (uint8_t)(1 << (mcp & 7));
+    }
+    return;
+  }
+
+  list = &msa->match_cache_runs[cache_point];
+  runs = list->runs;
+  num = list->num;
+#if MATCH_CACHE_RLE_HINT
+  {
+    long h = list->hint;
+    if (h < num) {
+      /* Fast path: extend the last touched run at either end. */
+      if (runs[h].start == pos + 1) {
+        if (h == 0 || runs[h - 1].end < pos) { runs[h].start = pos; return; }
+      }
+      else if (runs[h].end == pos) {
+        if (h + 1 == num || runs[h + 1].start > pos + 1) { runs[h].end = pos + 1; return; }
+      }
+      else if (runs[h].start <= pos && pos < runs[h].end) return;
+    }
+  }
+#endif
+  lo = 0; hi = num;
+  while (lo < hi) {
+    long mid = lo + ((hi - lo) >> 1);
+    if (runs[mid].start <= pos) lo = mid + 1;
+    else hi = mid;
+  }
+  /* runs[lo-1].start <= pos < runs[lo].start */
+  if (lo > 0) {
+    OnigMatchCacheRun* prev = &runs[lo - 1];
+#if MATCH_CACHE_RLE_HINT
+    list->hint = lo - 1;
+#endif
+    if (prev->end > pos) return;  /* already memoized */
+    if (prev->end == pos) {
+      if (lo < num && runs[lo].start == pos + 1) {
+        prev->end = runs[lo].end;
+        xmemmove(&runs[lo], &runs[lo + 1], (num - lo - 1) * sizeof(OnigMatchCacheRun));
+        list->num--;
+      }
+      else {
+        prev->end = pos + 1;
+      }
+      return;
+    }
+  }
+  if (lo < num && runs[lo].start == pos + 1) {
+    runs[lo].start = pos;
+#if MATCH_CACHE_RLE_HINT
+    list->hint = lo;
+#endif
+    return;
+  }
+  if (num == list->cap) {
+    long newcap = list->cap == 0 ? 4 : list->cap * 2;
+    OnigMatchCacheRun* nr = (OnigMatchCacheRun*)xrealloc(runs, newcap * sizeof(OnigMatchCacheRun));
+    if (nr == NULL) return;  /* not memoizing is always sound */
+    msa->match_cache_rle_bytes += (size_t)(newcap - list->cap) * sizeof(OnigMatchCacheRun);
+    if (msa->match_cache_rle_bytes > msa->match_cache_rle_peak_bytes) {
+      msa->match_cache_rle_peak_bytes = msa->match_cache_rle_bytes;
+    }
+    list->runs = runs = nr;
+    list->cap = newcap;
+  }
+  xmemmove(&runs[lo + 1], &runs[lo], (num - lo) * sizeof(OnigMatchCacheRun));
+  runs[lo].start = pos;
+  runs[lo].end = pos + 1;
+  list->num++;
+#if MATCH_CACHE_RLE_HINT
+  list->hint = lo;
+#endif
+  if (msa->match_cache_rle_bytes > msa->match_cache_bitmap_bytes) {
+    match_cache_rle_to_bitmap(msa);
   }
 }
 
@@ -2628,6 +2837,15 @@ match_at(regex_t* reg, const UChar* str, const UChar* end,
     const OnigCacheOpcode *cache_opcode;\
     long cache_point = find_cache_point(reg, msa->cache_opcodes, msa->num_cache_opcodes, pbegin, stk_base, repeat_stk, &cache_opcode);\
     if (cache_point >= 0) {\
+      if (msa->match_cache_runs != NULL) {\
+        long rle_pos = (long)(s - str);\
+        if (match_cache_rle_check(&msa->match_cache_runs[cache_point], rle_pos)) {\
+          MATCH_CACHE_DEBUG_HIT; MATCH_CACHE_HIT;\
+          goto fail;\
+        }\
+        STACK_PUSH_RLE_MATCH_CACHE_POINT(cache_point, rle_pos);\
+      }\
+      else {\
       long match_cache_point = msa->num_cache_points * (long)(s - str) + cache_point;\
       long match_cache_point_index = match_cache_point >> 3;\
       uint8_t match_cache_point_mask = 1 << (match_cache_point & 7);\
@@ -2652,6 +2870,7 @@ match_at(regex_t* reg, const UChar* str, const UChar* end,
         }\
       }\
       STACK_PUSH_MATCH_CACHE_POINT(match_cache_point_index, match_cache_point_mask);\
+      }\
     }\
   }\
 } while (0)
@@ -4165,7 +4384,7 @@ match_at(regex_t* reg, const UChar* str, const UChar* end,
           }
 #endif
         }
-        if (msa->match_cache_buf == NULL) {
+        if (msa->match_cache_buf == NULL && msa->match_cache_runs == NULL) {
           size_t length = (end - str) + 1;
           size_t num_match_cache_points = (size_t)msa->num_cache_points * length;
 #ifdef ONIG_DEBUG_MATCH_CACHE
@@ -4179,12 +4398,40 @@ match_at(regex_t* reg, const UChar* str, const UChar* end,
             return ONIGERR_MEMORY;
           }
           size_t match_cache_buf_length = (num_match_cache_points >> 3) + (num_match_cache_points & 7 ? 1 : 0) + 1;
-          uint8_t* match_cache_buf = (uint8_t*)xmalloc(match_cache_buf_length * sizeof(uint8_t));
-          if (match_cache_buf == NULL) {
-            return ONIGERR_MEMORY;
+          size_t rle_init_bytes = (size_t)msa->num_cache_points * sizeof(OnigMatchCacheRunList);
+          int rle_ok;
+          msa->match_cache_bitmap_bytes = match_cache_buf_length;
+          if (match_cache_rle_enabled < 0) {
+            const char* e = getenv("ONIG_MATCH_CACHE_RLE");
+            match_cache_rle_enabled = !(e != NULL && e[0] == '0');
           }
-          xmemset(match_cache_buf, 0, match_cache_buf_length * sizeof(uint8_t));
-          msa->match_cache_buf = match_cache_buf;
+          rle_ok = match_cache_rle_enabled && rle_init_bytes < match_cache_buf_length;
+          if (rle_ok) {
+            /* Lookaround/atomic cache points use the 2-bit extended encoding; keep them on the bitmap. */
+            long i;
+            for (i = 0; i < msa->num_cache_opcodes; i++) {
+              if (msa->cache_opcodes[i].lookaround_nesting != 0) { rle_ok = 0; break; }
+            }
+          }
+          if (rle_ok) {
+            OnigMatchCacheRunList* runs = (OnigMatchCacheRunList*)xcalloc(msa->num_cache_points, sizeof(OnigMatchCacheRunList));
+            if (runs == NULL) {
+              return ONIGERR_MEMORY;
+            }
+            msa->match_cache_runs = runs;
+            msa->match_cache_rle_bytes = rle_init_bytes;
+            msa->match_cache_rle_peak_bytes = rle_init_bytes;
+            msa->match_cache_mode = 2;
+          }
+          else {
+            uint8_t* match_cache_buf = (uint8_t*)xmalloc(match_cache_buf_length * sizeof(uint8_t));
+            if (match_cache_buf == NULL) {
+              return ONIGERR_MEMORY;
+            }
+            xmemset(match_cache_buf, 0, match_cache_buf_length * sizeof(uint8_t));
+            msa->match_cache_buf = match_cache_buf;
+            msa->match_cache_mode = 1;
+          }
         }
       }
       fail_match_cache:
