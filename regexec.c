@@ -1115,6 +1115,17 @@ match_cache_runs_free(OnigMatchCacheRunList* lists, long num_cache_points)
 {
   long i;
   if (lists == NULL) return;
+#ifdef ONIG_DEBUG_MATCH_CACHE
+  {
+    size_t bytes = (size_t)num_cache_points * sizeof(OnigMatchCacheRunList);
+    long runs = 0;
+    for (i = 0; i < num_cache_points; i++) {
+      bytes += (size_t)lists[i].capacity * sizeof(OnigMatchCacheRun);
+      runs += lists[i].count;
+    }
+    fprintf(stderr, "MATCH CACHE: free rle_bytes=%zu runs=%ld\n", bytes, runs);
+  }
+#endif
   for (i = 0; i < num_cache_points; i++) {
     xfree(lists[i].runs);
   }
@@ -1201,6 +1212,9 @@ match_cache_convert_to_bitmap(OnigMatchArg* msa)
 {
   long cp;
   uint8_t* buf = (uint8_t*)xmalloc(msa->match_cache_buf_length);
+#ifdef ONIG_DEBUG_MATCH_CACHE
+  fprintf(stderr, "MATCH CACHE: fallback to bitmap rle_bytes=%zu bitmap_bytes=%zu\n", msa->match_cache_rle_bytes, msa->match_cache_buf_length);
+#endif
   if (buf == NULL) {
     msa->match_cache_status = MATCH_CACHE_STATUS_DISABLED;
   }
@@ -4413,6 +4427,9 @@ match_at(regex_t* reg, const UChar* str, const UChar* end,
             msa->match_cache_runs = runs;
             msa->match_cache_rle_bytes = runs_length;
             msa->match_cache_status = MATCH_CACHE_STATUS_ENABLED_RLE;
+#ifdef ONIG_DEBUG_MATCH_CACHE
+            fprintf(stderr, "MATCH CACHE: mode=rle cache_points=%ld bitmap_bytes=%zu\n", msa->num_cache_points, match_cache_buf_length);
+#endif
             goto fail_match_cache;
           }
 #endif
@@ -4422,6 +4439,9 @@ match_at(regex_t* reg, const UChar* str, const UChar* end,
           }
           xmemset(match_cache_buf, 0, match_cache_buf_length * sizeof(uint8_t));
           msa->match_cache_buf = match_cache_buf;
+#ifdef ONIG_DEBUG_MATCH_CACHE
+          fprintf(stderr, "MATCH CACHE: mode=bitmap cache_points=%ld bitmap_bytes=%zu\n", msa->num_cache_points, match_cache_buf_length);
+#endif
         }
       }
       fail_match_cache:
